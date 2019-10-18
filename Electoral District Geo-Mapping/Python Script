@@ -1,0 +1,318 @@
+
+# Import libraries
+
+import pandas as pd
+import numpy as np
+import requests
+import os
+import pandas as pd
+import json
+import xml.etree.ElementTree as ET
+import cx_Oracle
+
+
+# Connecting to Oracle database to pull data
+# Note that code was highly altered for confidentiality purposes
+
+conn = cx_Oracle.connect('server connection here')
+
+query = """
+select trim(pomst.vendor_code) as vendor_code, trim(pomst.vendor_suffix) as vendor_suffix, polin.po_line_cost, pomst.PO_ORIG_ISSUE_DATE
+
+from repository.purchase_order pomst
+
+join repository.tidpolin polin
+on pomst.purchase_order_nbr = polin.purchase_order_nbr
+and pomst.po_revision_nbr = polin.po_revision_nbr
+and pomst.po_release_nbr = polin.po_release_nbr
+
+where
+pomst.po_release_nbr <> '00000'
+and pomst.po_orig_issue_date <> ' '
+and pomst.po_orig_issue_date >= '20160101'
+and polin.catalog_id <> ' '
+and pomst.po_status in ('OPEN','COMPLETE','CLOSED','HISTORY')
+and polin.po_line_status in ('OPEN','COMPLETE','CLOSED','HISTORY')
+
+"""
+
+pomst = pd.read_sql(query, conn)
+
+query = """
+select
+trim(vnmst.vendor_code) as vendor_code,
+trim(vnmst.vendor_suffix) as vendor_suffix,
+vnmst.vendor_supply_name,
+trim(vnadr.vendor_address_1) as vendor_address_1,
+trim(vnadr.vendor_address_2) as vendor_address_2,
+trim(vnadr.vendor_address_3) as vendor_address_3,
+trim(vnadr.city) as city,
+trim(vnadr.state) as state,
+trim(vnadr.country_code) as country_code,
+trim(vnadr.zip_code_10) as zip_code_10
+
+from repository.vendor_info vnadr
+
+join repository.vendor_address vnmst
+on vnadr.vendor_code = vnmst.vendor_code
+and vnadr.vendor_suffix = vnmst.vendor_suffix
+and vnadr.vendor_addr_rev = vnmst.vendor_addr_rev
+
+where vnadr.country_code in 'CA' and vnadr.state in 'ON'
+
+order by vnmst.vendor_code, vnmst.vendor_suffix
+
+"""
+
+vnmst = pd.read_sql(query, conn)
+
+query = """
+select
+cnmst.contract_id as Contract#,
+cnmst.contract_release as Rel#,
+cnmst.contract_status as Status,
+cnmst.contract_title as Title,
+cnmst.contr_amt as ContractValue,
+trim(cnmst.vendor_code) as VendorCode,
+trim(cnmst.vendor_suffix) as Suff,
+cnmst.contr_start_dt as StartDt,
+cnmst.contr_end_dt as EndDt,
+cnmst.contract_type as Type,
+apmst.payment_date as PayDate,
+apmst.payment_amt as PayAmt
+
+from repository.contract_data cnmst
+
+join repository.service_data apmst
+on cnmst.vendor_code = apmst.vendor_code
+and cnmst.vendor_suffix = apmst.vendor_suffix
+and cnmst.contract_id = apmst.contract_id
+and cnmst.contract_release = apmst.contract_release
+
+where
+cnmst.contract_release <> '00000'
+and cnmst.contract_status in ('ISSUED','COMPLETE','CLOSED','HISTORY')
+and apmst.payment_status = 'PAID'
+and apmst.payment_date >= '20160101'
+and apmst.contract_id <> '^'
+"""
+
+cnmst = pd.read_sql(query, conn)
+
+
+
+################################ DATA WRANGLING ################################
+
+# General clean-up
+
+    ## fill in 0 for NANs
+cnmst['SUFF'] = cnmst['SUFF'].replace(np.nan, 0)
+vnmst['VENDOR_SUFFIX'] = vnmst['VENDOR_SUFFIX'].replace(np.nan, 0)
+pomst['VENDOR_SUFFIX'] = pomst['VENDOR_SUFFIX'].replace(np.nan, 0)
+
+
+    ## create unique IDs for Vendors (VENDORCODE_SUFFIX)
+vnmst['ID'] = vnmst['VENDOR_CODE'] + '_' + vnmst['VENDOR_SUFFIX'].map(str)
+pomst['ID'] = pomst['VENDOR_CODE'] + '_' + pomst['VENDOR_SUFFIX'].map(str)
+cnmst['ID'] = cnmst['VENDORCODE'] + '_' + cnmst['SUFF'].map(str)
+
+
+
+    ## extract year column
+pomst['YEAR']=pomst['PO_ORIG_ISSUE_DATE'].astype(str).str[0:4]
+cnmst['YEAR']=cnmst['PAYDATE'].astype(str).str[0:4]
+
+
+# Purchase Order Data Clean-Up
+
+    ## aggregate data
+po_data = pomst.groupby(by = ['ID', 'YEAR'])['PO_LINE_COST'].sum()
+po_data= pd.Series.to_frame(po_data)
+po_data.reset_index(inplace=True)
+
+
+# Contractor Data Clean-Up
+
+    ## aggregate data
+service_data = cnmst.groupby(by = ['ID', 'YEAR'])['PAYAMT'].sum()
+service_data= pd.Series.to_frame(service_data)
+service_data.reset_index(inplace=True)
+
+
+# Vendor Location Clean-Up
+vend_add = vnmst
+
+    ## filter for Canada and Ontario
+vend_add = vnmst[vnmst['COUNTRY_CODE'] == 'CA']
+vend_add = vnmst[vnmst['STATE'] == 'ON']
+
+
+    ## join Purchase Order data and Contractor data to get spend for two categories
+cnmst_pomst= pd.merge(service_data, po_data, on=['ID', 'YEAR'], how='outer')
+
+
+# Purchase Order and Contractor data Clean-Up
+
+    ## nulls after outer-join, replace nulls with zero
+cnmst_pomst['PAYAMT'] = cnmst_pomst['PAYAMT'].replace(np.nan, 0)
+cnmst_pomst['PO_LINE_COST'] = cnmst_pomst['PO_LINE_COST'].replace(np.nan, 0)
+
+    ## calculate total spend
+cnmst_pomst['Total Spend'] = cnmst_pomst['PAYAMT'] + cnmst_pomst['PO_LINE_COST']
+
+
+# Purchase Order and Contractor join with Vendor Location data
+
+merged = pd.merge(vend_add,cnmst_pomst,how='inner',on=['ID'])
+merged['VENDOR_ADDRESS_3'] = merged['VENDOR_ADDRESS_3'].astype('str').replace('None', ' ')
+
+    ## create Location column
+merged['Location'] = merged['VENDOR_ADDRESS_1'].astype('str') + ', ' + merged['VENDOR_ADDRESS_2'].astype('str') + ', ' + merged['VENDOR_ADDRESS_3'].astype('str') + ', ' + merged['CITY'].astype('str') + ', ' +', ' + merged['STATE'].astype('str') + ', ' + merged['COUNTRY_CODE'].astype('str') + ', ' + merged['ZIP_CODE_10'].astype('str')
+merged['Location']=merged['Location'].str.replace('#', '')
+merged['Location']=merged['Location'].str.replace('&', ' and ')
+
+
+########### RETRIEVING GEO-COORDINATES FROM VENDOR ADDRESSES ##########
+
+    ## proxy bypass
+proxy1 = "connection goes here"
+os.environ['http_proxy'] = proxy1
+
+    ## check to see if proxy has been applied
+print(os.environ)
+requests.utils.getproxies()
+
+
+    ## adding the column for latitude
+merged['latitude'] = ' '
+
+    ## adding the column for longitude
+merged['longitude'] = ' '
+
+
+
+# Function that generates the url for the Bing Maps (Microsoft) API
+
+def getUrl(x):
+
+    ## concatenating the coordinates to generate the url
+    url = 'http://dev.virtualearth.net/REST/v1/Locations/' + str(x) + '?o=xml&key=Zll6jqYBc6SzPIY7Ndfa~J6EC-Danv8Uz7sL5hwQECg~AmvX1nTWjQkqEBK2iffRcGCf81qlHPZP_I4ACLKSt71I5X7ISKxPuNoSBhg_Keke'
+
+    ## returning the url
+    return url
+
+
+# Function that pulls longitude and latitude using API
+
+def getGeo(url):
+
+    ## getting the data from api
+    r = requests.get(url)
+    root = ET.fromstring(r.content)
+
+    ## getting the latitude
+
+    for child in root.iter('{http://schemas.microsoft.com/search/local/ws/rest/v1}Latitude'):
+        latitude=child.text
+        break
+
+    ## getting the longitude
+    for child in root.iter('{http://schemas.microsoft.com/search/local/ws/rest/v1}Longitude'):
+        longitude= child.text
+        break
+
+    ## return coordinates
+    return(latitude,longitude)
+
+
+# Validation:
+x='655 BAY STREET, 17TH FLOOR, , TORONTO, ON, CA, M5G 2K4'
+y=getUrl(x)
+print(y)
+getGeo(y)
+
+
+# For loop that gets the latitude and longitude for each address and adds to dataset
+# columns 'latitude' and 'longitude'.
+# If address is broken, skip.
+
+for i in merged.index:
+    try:
+    ## read address from dataset
+        x = merged.loc[i, 'Location']
+
+    ## get the corresponding url using Location information
+        url = getUrl(x)
+
+    ## get the latitude and longitude from the url
+        lat,long = getGeo(url)
+
+    ## add latitude to the dataset
+        merged.loc[i, 'latitude'] = lat
+
+    ## add longitude to the dataset
+        merged.loc[i, 'longitude'] = long
+    except:
+        pass
+
+
+
+########### RETRIEVING ELECTORAL DISTRICTS FROM GEO-COORDINATES ###########
+
+# Adding the column for provincial district
+merged['provincial'] = ' '
+
+
+# Function that generates the url for the api from the geocoordinates
+
+def getUrl(x,y):
+
+    ## concatenating the coordinates to generate the url
+    url = 'http://represent.opennorth.ca/boundaries/?contains=' + str(x) + ','  + str(y)
+
+    ## returning the url
+    return url
+
+
+# Function to communicate with the api
+# get the response & extract out the information
+def getDistrict(url):
+
+    ## getting the data from api
+    response = requests.get(url).json()
+
+    ## getting the provincial electoral district
+    provincial = response['objects'][0]['name']
+
+    ## returning the districts
+    return (provincial)
+
+
+# Loop through dataset, getting the districts for geocoordinates
+# and adding them to the dataset.
+# If no result from API, skip.
+
+for i in merged.index:
+    try:
+        ## getting coordinates
+        x = merged.loc[i, 'latitude']
+        y = merged.loc[i, 'longitude']
+
+        ## getting the corresponding url for coordinates
+        url = getUrl(x, y)
+
+        ## getting the districts for the url
+        prov = getDistrict(url)
+
+
+        ## adding the provincial district to the dataset
+        merged.loc[i, 'provincial'] = prov
+    except:
+        pass
+
+
+# Last Clean-Up
+merged['provincial']=merged['provincial'].str.replace('—', '---')
+
+
+##### OUTPUT TO BE SOURCED INTO FOLDER WHICH IS CONNECTED TO POWERBI MAP #######
