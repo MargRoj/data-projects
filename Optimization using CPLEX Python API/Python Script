@@ -1,0 +1,142 @@
+
+# Import pandas and cplex
+import pandas as pd
+import cplex
+
+# Read data from files and assign to dataframes
+mill_data = pd.read_csv('Mill_Data.csv')
+customer_data = pd.read_csv('Customer_Data.csv')
+
+
+# Convert dataframes to nested lists
+customer_data = customer_data.values.tolist()
+
+#convert integers to float
+mill_data = mill_data.astype(float) 
+
+#convert to nested list
+mill_data = mill_data.values.tolist() 
+
+#Assign first three rows of Customer_Data.csv to dist_cost
+dist_cost = customer_data[0:3]
+
+#Assign fourth row of Customer_Data.csv to purch_price
+purch_price = customer_data[3]
+
+#Assign fifth row of Customer_Data.csv to demand
+demand = customer_data[4]
+
+#Assign values to max_prod, min_prod, and prod_cost
+max_prod = mill_data[0]
+min_prod = mill_data[1]
+prod_cost = mill_data[2]
+
+#Find the size of the model
+num_mills = len(prod_cost)
+num_customers = len(demand)
+
+# Create list of objective function coefficients
+# order of coefficients should be A1, A2, ..., A9, B1, B2, ..., B9, C1, C2, ..., C9
+obj_coeff = []
+for mill in range(num_mills):
+    for customer in range(num_customers):
+        obj_coeff.append(purch_price[customer]-prod_cost[mill]-dist_cost[mill][customer])
+
+# Create corresponding indices for later use, Xvar[mill][customer]
+Xvar = []
+for m in range(num_mills):
+    Xvar.append([])
+    for c in range(num_customers):
+        Xvar[m].append(m * num_customers + c)
+
+
+###################################
+#Create an empty model and call it "Northwest"
+
+Northwest = cplex.Cplex()
+
+
+# Set objective to maximize profit
+Northwest.objective.set_sense(Northwest.objective.sense.maximize)
+
+# Add variables to model
+Northwest.variables.add(obj = obj_coeff,
+                        lb = [0]*num_mills*num_customers,
+                        ub = [cplex.infinity]*num_mills*num_customers)
+
+###################################
+# Add constraints to the model
+
+# Constraint: Customer demand must be met exactly
+for c in range(num_customers):
+    index = []
+    value = []
+    for m in range(num_mills):
+        index.append(Xvar[m][c])
+        value.append(1.0)
+        
+    demand_constraint = cplex.SparsePair(ind=index,val=value)
+    Northwest.linear_constraints.add(lin_expr = [demand_constraint],
+                                     senses = ["E"],
+                                     rhs = [demand[c]],
+                                     names = ["Demand_" +str(c)])
+   
+# Constraint: Production cannot exceed maximum capacity
+for m in range(num_mills):
+    index = []
+    value = []
+    for c in range(num_customers):
+        index.append(Xvar[m][c])
+        value.append(1.0)
+    maxprod_constraint = cplex.SparsePair(ind=index,val=value)
+    Northwest.linear_constraints.add(lin_expr = [maxprod_constraint],
+                                     senses = ["L"],
+                                     rhs = [max_prod[m]],
+                                     names = ["MaxProd_" +str(m)])
+
+# Constraint: Production must be at least at minimum capacity
+for m in range(num_mills):
+    index2 = []
+    value2 = []
+    for c in range(num_customers):
+        index2.append(Xvar[m][c])
+        value2.append(1.0)
+    minprod_constraint = cplex.SparsePair(ind=index2,val=value2)
+    Northwest.linear_constraints.add(lin_expr = [minprod_constraint],
+                                     senses = ["G"],
+                                     rhs = [min_prod[m]],
+                                     names = ["MinProd_" +str(m)])
+
+# Constraint: Set flows on non-existent arcs equal to zero
+Northwest.variables.set_upper_bounds(Xvar[0][0], 0)
+Northwest.variables.set_upper_bounds(Xvar[0][5], 0)
+Northwest.variables.set_upper_bounds(Xvar[0][7], 0)
+Northwest.variables.set_upper_bounds(Xvar[0][8], 0)
+
+
+
+######################################################################
+# Solve
+
+Northwest.solve()
+
+######################################################################
+#Print Solution
+
+print("")
+print("========")
+print("Profit = %d \n" %Northwest.solution.get_objective_value())
+for m in range(num_mills):
+    for c in range(num_customers):
+        if Northwest.solution.get_values(Xvar[m][c]) > 1e-10:
+            print("X(%d,%d) = %d" %(m,c,Northwest.solution.get_values(Xvar[m][c])))
+          
+
+######################################################################
+# Sensitivity Test
+
+Northwest.solution.get_reduced_costs([Xvar[1][2],Xvar[2][7]]) #reduced cost for X_B3 and X_C8
+Northwest.solution.get_linear_slacks("MaxProd_1") #slack in Maximum Production Constraint for Mill B
+Northwest.solution.get_dual_values("Demand_3","Demand_7") #dual of demand constraints for Customers 4 and 8
+
+
